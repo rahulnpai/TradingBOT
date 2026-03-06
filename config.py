@@ -31,6 +31,9 @@ class TradingConfig:
     paper_trading: bool   = True          # False → live orders
     trading_mode: str     = "intraday"    # "intraday" | "swing"
 
+    # ---- capital ---------------------------------------------------------
+    capital: float        = float(os.getenv("TRADING_CAPITAL", "5000"))
+
     # ---- watchlist -------------------------------------------------------
     symbols: List[str] = field(default_factory=lambda: [
         "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK",
@@ -56,7 +59,7 @@ class TradingConfig:
 
 @dataclass
 class RiskConfig:
-    capital: float                = float(os.getenv("TRADING_CAPITAL", "100000"))
+    capital: float                   = float(os.getenv("TRADING_CAPITAL", "5000"))
     max_capital_per_trade_pct: float = 0.02   # 2 % per trade
     daily_loss_limit_pct: float      = 0.03   # 3 % daily hard stop
     max_open_positions: int          = 5
@@ -64,6 +67,10 @@ class RiskConfig:
     default_target_pct: float        = 0.030  # 3 % target  → 1:2 RR
     trailing_sl: bool                = True
     trailing_sl_pct: float           = 0.010  # 1 % trailing
+
+    # ---- professional risk controls --------------------------------------
+    max_trades_per_symbol: int       = 3      # max entries per symbol per day
+    cooldown_minutes: int            = 15     # no-trade window after SL exit
 
 
 @dataclass
@@ -120,21 +127,29 @@ class Config:
     ai:        AIConfig        = field(default_factory=AIConfig)
     backtest:  BacktestConfig  = field(default_factory=BacktestConfig)
 
+    # ---- runtime mode ----------------------------------------------------
+    data_provider: str = "yahoo"    # "yahoo" | "zerodha"
+    history_days: int  = 120        # candle lookback window for all modes
+
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     log_file:  str = "logs/ai_trader.log"
     data_dir:  str = "data"
     cache_dir: str = "cache"
 
+    def __post_init__(self) -> None:
+        # Keep risk.capital in sync with trading.capital (trading takes precedence)
+        self.risk.capital = self.trading.capital
+
     def validate(self) -> None:
-        """Raise ValueError if critical config is missing for live trading."""
-        if not self.trading.paper_trading:
+        """Raise ValueError if critical config is missing for the active data provider."""
+        if self.data_provider == "zerodha":
             if not self.kite.api_key or not self.kite.api_secret:
                 raise ValueError(
-                    "KITE_API_KEY and KITE_API_SECRET must be set for live trading."
+                    "KITE_API_KEY and KITE_API_SECRET must be set for Zerodha data provider."
                 )
             if not self.kite.access_token:
                 raise ValueError(
-                    "KITE_ACCESS_TOKEN must be set for live trading. "
+                    "KITE_ACCESS_TOKEN must be set for Zerodha data provider. "
                     "Run 'python kite_client.py --login' first."
                 )
 

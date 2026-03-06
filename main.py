@@ -2,14 +2,23 @@
 main.py — AI Trader entry point and main event loop.
 
 Scheduling:
-  • Every N minutes (intraday_interval) during market hours:
+  • Every N minutes (intraday_interval) during market hours (sim/live):
       fetch → indicators → signal → AI → risk → execute
+  • Paper mode: runs every 5 minutes, 24/7, using historical candles.
   • At market open: initialise data, print daily header.
-  • At intraday exit time (15:10): force-close all MIS positions.
+  • At intraday exit time (15:10): force-close all MIS positions (sim/live only).
   • At market close: daily P&L report, persist state.
 
 Usage:
-  python main.py [--mode intraday|swing] [--paper|--live]
+  python main.py paper          ← Yahoo data, paper fills, 24/7
+  python main.py sim            ← Zerodha data, paper fills, market hours
+  python main.py live           ← Zerodha data, real orders, market hours
+
+  Legacy flags still work:
+  python main.py --paper
+  python main.py --live
+  python main.py --mode intraday|swing
+  python main.py --run-now
 """
 
 from __future__ import annotations
@@ -24,6 +33,7 @@ from typing import Dict, List
 import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from rich.console import Console
 from rich.table import Table
 from tabulate import tabulate
@@ -68,12 +78,14 @@ def _is_intraday_exit_window() -> bool:
 
 
 def _print_banner() -> None:
+    mode_label = "PAPER" if config.trading.paper_trading else "LIVE "
+    provider   = config.data_provider.upper()
     log.print(
         "\n[bold cyan]╔══════════════════════════════════════════╗[/bold cyan]"
         "\n[bold cyan]║     AI TRADER  —  Zerodha KiteConnect    ║[/bold cyan]"
         "\n[bold cyan]║          Indian Stock Market Bot         ║[/bold cyan]"
-        f"\n[bold cyan]║  Mode: {'PAPER' if config.trading.paper_trading else 'LIVE ':5s}"
-        f"  Strategy: {config.trading.trading_mode:10s}  ║[/bold cyan]"
+        f"\n[bold cyan]║  Mode: {mode_label}  Provider: {provider:8s}         ║[/bold cyan]"
+        f"\n[bold cyan]║  Strategy: {config.trading.trading_mode:10s}                   ║[/bold cyan]"
         "\n[bold cyan]╚══════════════════════════════════════════╝[/bold cyan]\n"
     )
 
@@ -113,7 +125,8 @@ def _print_daily_summary() -> None:
 # ---------------------------------------------------------------------------
 
 def trading_cycle() -> None:
-    if not _is_market_open():
+    # Paper mode runs 24/7 on historical candles; skip market-hours gate
+    if not config.trading.paper_trading and not _is_market_open():
         logger.debug("Market closed — skipping cycle.")
         return
 
@@ -128,15 +141,16 @@ def trading_cycle() -> None:
         else config.trading.swing_interval
     )
 
-    logger.info("=== Trading cycle | %s | %s ===", mode, _now_ist().strftime("%H:%M:%S"))
+    logger.info("=== Trading cycle | %s | %s | %s ===",
+                mode, config.data_provider, _now_ist().strftime("%H:%M:%S"))
 
     # ---- 1. Fetch current prices for position monitoring ---------------
     prices = data_fetcher.get_batch_quotes(symbols)
     if prices:
         trader.monitor_positions(prices)
 
-    # ---- 2. Handle intraday exit window --------------------------------
-    if mode == "intraday" and _is_intraday_exit_window():
+    # ---- 2. Handle intraday exit window (sim/live only) ----------------
+    if mode == "intraday" and not config.trading.paper_trading and _is_intraday_exit_window():
         logger.info("Intraday exit window — closing all MIS positions.")
         trader.close_all(prices, reason="eod_intraday")
         return
@@ -157,9 +171,9 @@ def trading_cycle() -> None:
 
 
 def _process_symbol(symbol: str, mode: str, interval: str) -> None:
-    # Fetch candles
-    days = 30 if mode == "intraday" else 365
-    df   = data_fetcher.get_historical(symbol, interval, days=days, use_cache=False)
+    # Use config.history_days to ensure EMA200 / VWAP have enough data
+    df = data_fetcher.get_historical(symbol, interval,
+                                     days=config.history_days, use_cache=False)
     if df.empty or len(df) < 50:
         logger.debug("Insufficient data for %s", symbol)
         return
@@ -184,11 +198,13 @@ def _process_symbol(symbol: str, mode: str, interval: str) -> None:
     # Attempt trade
     result = trader.process_signal(signal)
     if result:
+        color = "green" if result.action == "BUY" else "red"
         log.print(
-            f"[bold {'green' if result.action == 'BUY' else 'red'}]"
+            f"[bold {color}]"
             f"✓ TRADE EXECUTED: {result.action} {result.symbol} x{result.quantity}"
             f" @ ₹{result.fill_price:.2f}  "
-            f"SL=₹{result.stoploss:.2f}  TGT=₹{result.target:.2f}[/bold {'green' if result.action == 'BUY' else 'red'}]"
+            f"SL=₹{result.stoploss:.2f}  TGT=₹{result.target:.2f}"
+            f"[/bold {color}]"
         )
 
 
@@ -199,8 +215,8 @@ def _process_symbol(symbol: str, mode: str, interval: str) -> None:
 def on_market_open() -> None:
     logger.info("Market opened — initialising day.")
     _print_banner()
-    # Pre-warm instrument cache
-    if not config.trading.paper_trading and kite_client._kite:
+    # Pre-warm instrument cache for Zerodha modes
+    if config.data_provider == "zerodha" and kite_client._kite:
         kite_client.preload_instruments()
 
 
@@ -230,7 +246,7 @@ def on_market_close() -> None:
 def _build_scheduler() -> BlockingScheduler:
     sched = BlockingScheduler(timezone=IST)
 
-    # Market open (Mon–Fri 09:15)
+    # Market open (Mon–Fri 09:15) — always schedule for daily header / cache warm
     sched.add_job(on_market_open, CronTrigger(
         day_of_week="mon-fri", hour=9, minute=15, timezone=IST
     ), id="market_open")
@@ -240,19 +256,24 @@ def _build_scheduler() -> BlockingScheduler:
         day_of_week="mon-fri", hour=15, minute=30, timezone=IST
     ), id="market_close")
 
-    # Intraday trading cycle — every 5 min during market hours
-    if config.trading.trading_mode == "intraday":
-        sched.add_job(trading_cycle, CronTrigger(
-            day_of_week="mon-fri",
-            hour="9-15", minute="*/5",
-            timezone=IST,
-        ), id="intraday_cycle")
+    if config.trading.paper_trading:
+        # Paper / sim: run every 5 minutes, 24/7 (historical candles always available)
+        sched.add_job(trading_cycle, IntervalTrigger(minutes=5), id="paper_cycle")
+        logger.info("Scheduler: 24/7 paper cycle (every 5 min).")
     else:
-        # Swing: run once at market open + once mid-session
-        for h, m in [(9, 20), (12, 0)]:
+        # Live: run only during market hours
+        if config.trading.trading_mode == "intraday":
             sched.add_job(trading_cycle, CronTrigger(
-                day_of_week="mon-fri", hour=h, minute=m, timezone=IST
-            ), id=f"swing_cycle_{h}{m}")
+                day_of_week="mon-fri",
+                hour="9-15", minute="*/5",
+                timezone=IST,
+            ), id="intraday_cycle")
+        else:
+            # Swing: run once at market open + once mid-session
+            for h, m in [(9, 20), (12, 0)]:
+                sched.add_job(trading_cycle, CronTrigger(
+                    day_of_week="mon-fri", hour=h, minute=m, timezone=IST
+                ), id=f"swing_cycle_{h}{m}")
 
     return sched
 
@@ -277,71 +298,124 @@ def _handle_sigint(signum, frame) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="AI Trader — Zerodha KiteConnect")
+
+    # Positional mode argument (new style)
+    parser.add_argument(
+        "mode", nargs="?",
+        choices=["paper", "sim", "live"],
+        default=None,
+        help="Runtime mode: paper (Yahoo, no orders) | sim (Zerodha, no orders) | live (Zerodha, real orders)",
+    )
+
+    # Legacy flags kept for backward compatibility
     mode_g = parser.add_mutually_exclusive_group()
-    mode_g.add_argument("--paper", action="store_true",
-                        help="Paper trading mode (default)")
-    mode_g.add_argument("--live",  action="store_true",
-                        help="Live trading (real orders)")
-    parser.add_argument("--mode", choices=["intraday", "swing"], default=None,
-                        help="Override trading mode from config")
+    mode_g.add_argument("--paper", action="store_true", help="Paper trading mode (legacy flag)")
+    mode_g.add_argument("--live",  action="store_true", help="Live trading — real orders (legacy flag)")
+
+    parser.add_argument("--mode-strategy", dest="mode_strategy",
+                        choices=["intraday", "swing"], default=None,
+                        help="Override trading strategy from config")
     parser.add_argument("--run-now", action="store_true",
                         help="Run one trading cycle immediately (bypass scheduler)")
     args = parser.parse_args()
 
-    # Apply CLI overrides
-    if args.live:
-        config.trading.paper_trading = False
-    if args.mode:
-        config.trading.trading_mode = args.mode
+    # ----------------------------------------------------------------
+    # Apply mode → config mappings
+    # ----------------------------------------------------------------
+    if args.mode == "paper" or args.paper:
+        config.data_provider          = "yahoo"
+        config.trading.paper_trading  = True
 
-    # Validate
+    elif args.mode == "sim":
+        config.data_provider          = "zerodha"
+        config.trading.paper_trading  = True
+
+    elif args.mode == "live" or args.live:
+        config.data_provider          = "zerodha"
+        config.trading.paper_trading  = False
+
+    else:
+        # Default: paper mode (safe default, no credentials needed)
+        config.data_provider         = "yahoo"
+        config.trading.paper_trading = True
+
+    # Keep risk.capital in sync after any config change
+    config.risk.capital = config.trading.capital
+
+    if args.mode_strategy:
+        config.trading.trading_mode = args.mode_strategy
+
+    # ----------------------------------------------------------------
+    # Validate config
+    # ----------------------------------------------------------------
     try:
         config.validate()
     except ValueError as e:
         logger.critical("Config validation failed: %s", e)
         sys.exit(1)
 
+    # ----------------------------------------------------------------
+    # Startup log — required by spec
+    # ----------------------------------------------------------------
+    runtime_mode = args.mode or ("live" if not config.trading.paper_trading else
+                                 ("sim" if config.data_provider == "zerodha" else "paper"))
     _print_banner()
-    logger.info("Paper trading: %s", config.trading.paper_trading)
-    logger.info("Trading mode : %s", config.trading.trading_mode)
-    logger.info("Symbols      : %s", ", ".join(config.trading.symbols))
-    logger.info("Capital      : Rs %.0f", config.risk.capital)
+    logger.info("=" * 52)
+    logger.info("Running mode    : %s", runtime_mode.upper())
+    logger.info("Data provider   : %s", config.data_provider)
+    logger.info("Paper trading   : %s", config.trading.paper_trading)
+    logger.info("Capital         : Rs %.0f", config.risk.capital)
+    logger.info("Symbols         : %s", ", ".join(config.trading.symbols))
+    logger.info("History days    : %d", config.history_days)
+    logger.info("Trading strategy: %s", config.trading.trading_mode)
+    logger.info("=" * 52)
 
-    # Initialise Kite client
-    if not config.trading.paper_trading or config.kite.api_key:
+    # ----------------------------------------------------------------
+    # Initialise Kite client ONLY when provider is zerodha
+    # ----------------------------------------------------------------
+    if config.data_provider == "zerodha":
         try:
             kite_client.initialise()
         except Exception as e:
             if config.trading.paper_trading:
-                logger.warning("Kite init failed (paper mode — continuing): %s", e)
+                logger.warning("Kite init failed (sim mode — continuing): %s", e)
             else:
-                logger.critical("Kite init failed: %s", e)
+                logger.critical("Kite init failed (live mode): %s", e)
                 sys.exit(1)
+    else:
+        logger.info("Data provider: Yahoo Finance — Kite client not initialised.")
 
+    # ----------------------------------------------------------------
     # AI health check
+    # ----------------------------------------------------------------
     if config.ai.enabled:
         available = ai_engine.is_available()
-        logger.info(
-            "Ollama AI (%s): %s",
-            config.ai.model,
-            "[green]ONLINE[/green]" if available else "[yellow]OFFLINE — technical signals only[/yellow]",
-        )
+        status = "[green]ONLINE[/green]" if available else "[yellow]OFFLINE — technical signals only[/yellow]"
+        logger.info("Ollama AI (%s): %s", config.ai.model, status)
 
+    # ----------------------------------------------------------------
+    # One-shot mode for testing / debugging
+    # ----------------------------------------------------------------
     if args.run_now:
-        # One-shot for testing / debugging
         logger.info("Running immediate trading cycle ...")
         on_market_open()
         trading_cycle()
         _print_daily_summary()
         return
 
+    # ----------------------------------------------------------------
     # Start scheduler
+    # ----------------------------------------------------------------
     sched = _build_scheduler()
     _scheduler_ref.append(sched)
     _signal.signal(_signal.SIGINT,  _handle_sigint)
     _signal.signal(_signal.SIGTERM, _handle_sigint)
 
-    logger.info("Scheduler started. Waiting for market hours... (Ctrl+C to stop)")
+    if config.trading.paper_trading:
+        logger.info("Scheduler started. Running 24/7 in paper mode. (Ctrl+C to stop)")
+    else:
+        logger.info("Scheduler started. Waiting for market hours... (Ctrl+C to stop)")
+
     try:
         sched.start()
     except (KeyboardInterrupt, SystemExit):
