@@ -1,3 +1,4 @@
+.env.example
 .env
 .kite_token
 __pycache__/

@@ -1,4 +1,11 @@
 #!/bin/bash
-cd ~/claudeProjects/ai_trader
+
+# run.sh — helper script for mode switching
+
 source venv/bin/activate
-python3 main.py
+
+MODE=${1:-paper}
+
+echo "Starting bot in $MODE mode..."
+
+python main.py $MODE
