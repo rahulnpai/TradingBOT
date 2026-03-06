@@ -95,7 +95,7 @@ class AIConfig:
     enabled: bool      = True
     ollama_url: str    = os.getenv("OLLAMA_URL", "http://localhost:11434")
     model: str         = os.getenv("AI_MODEL",   "mistral")   # or deepseek-r1
-    timeout: int       = 5       # seconds per request
+    timeout: int       = 30       # seconds per request
     min_confidence: float = 0.55  # accept AI confirmation above this threshold
 
     # Throttle: minimum seconds between AI calls per symbol

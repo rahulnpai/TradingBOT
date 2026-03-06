@@ -129,7 +129,7 @@ class Backtester:
         # Fetch daily candles; use extra days at start for indicator warm-up
         lookback_days = int((self._end - self._start).days + 300)
         raw = self._fetcher.get_historical(
-            symbol, interval="5minute", days=lookback_days, use_cache=True
+            symbol, interval="day", days=lookback_days, use_cache=True
         )
         if raw.empty:
             log.warning("No data for %s", symbol)
@@ -198,7 +198,7 @@ class Backtester:
             if open_trade is None:
                 df_window = raw.iloc[: i + 1]
                 signal: Signal = self._strategy.generate_signal(
-                    symbol, df_window, mode="intraday"
+                    symbol, df_window, mode="swing"
                 )
 
                 if signal.is_actionable and signal.confidence >= 0.6:

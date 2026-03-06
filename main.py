@@ -51,6 +51,7 @@ def _now_ist() -> datetime:
     return datetime.now(IST)
 
 
+'''
 def _is_market_open() -> bool:
     now = _now_ist()
     if now.weekday() >= 5:          # Saturday / Sunday
@@ -58,7 +59,28 @@ def _is_market_open() -> bool:
     open_t  = dtime(config.trading.market_open_h,  config.trading.market_open_m)
     close_t = dtime(config.trading.market_close_h, config.trading.market_close_m)
     return open_t <= now.time() <= close_t
+'''
+def _is_market_open() -> bool:
+    """
+    Market hours gate.
+    In PAPER mode -> always allow trading.
+    In LIVE mode  -> respect NSE timings.
+    """
 
+    #Allow trading anytime in paper mode
+    if config.trading.paper_trading:
+        return True
+
+    now = _now_ist()
+
+    # Weekend check
+    if now.weekday() >= 5:  # Saturday / Sunday
+        return False
+
+    open_t  = dtime(config.trading.market_open_h,  config.trading.market_open_m)
+    close_t = dtime(config.trading.market_close_h, config.trading.market_close_m)
+
+    return open_t <= now.time() <= close_t
 
 def _is_intraday_exit_window() -> bool:
     now    = _now_ist()
@@ -171,7 +193,7 @@ def _process_symbol(symbol: str, mode: str, interval: str) -> None:
     signal = strategy_engine.generate_signal(symbol, df, mode=mode)
 
     if not signal.is_actionable:
-        logger.debug("%s: HOLD (%s)", symbol, signal.reason)
+        logger.info("%s: HOLD (%s)", symbol, signal.reason)
         return
 
     logger.info(
@@ -226,7 +248,7 @@ def on_market_close() -> None:
 # ---------------------------------------------------------------------------
 # Scheduler setup
 # ---------------------------------------------------------------------------
-
+'''
 def _build_scheduler() -> BlockingScheduler:
     sched = BlockingScheduler(timezone=IST)
 
@@ -255,8 +277,50 @@ def _build_scheduler() -> BlockingScheduler:
             ), id=f"swing_cycle_{h}{m}")
 
     return sched
+'''
+def _build_scheduler() -> BlockingScheduler:
+    sched = BlockingScheduler(timezone=IST)
 
+    # If paper mode → run every 1 minute continuously
+    if config.trading.paper_trading:
+        sched.add_job(
+            trading_cycle,
+            "interval",
+            minutes=1,
+            id="paper_cycle"
+        )
+        return sched
 
+    # ================= REAL MARKET MODE =================
+
+    # Market open (Mon–Fri 09:15)
+    sched.add_job(on_market_open, CronTrigger(
+        day_of_week="mon-fri", hour=9, minute=15, timezone=IST
+    ), id="market_open")
+
+    # Market close (Mon–Fri 15:30)
+    sched.add_job(on_market_close, CronTrigger(
+        day_of_week="mon-fri", hour=15, minute=30, timezone=IST
+    ), id="market_close")
+
+    # Intraday trading cycle — every 5 min during market hours
+    if config.trading.trading_mode == "intraday":
+        sched.add_job(trading_cycle, CronTrigger(
+            day_of_week="mon-fri",
+            hour="9-15",
+            minute="*/5",
+            timezone=IST,
+        ), id="intraday_cycle")
+    else:
+        for h, m in [(9, 20), (12, 0)]:
+            sched.add_job(trading_cycle, CronTrigger(
+                day_of_week="mon-fri",
+                hour=h,
+                minute=m,
+                timezone=IST
+            ), id=f"swing_cycle_{h}{m}")
+
+    return sched
 # ---------------------------------------------------------------------------
 # Graceful shutdown
 # ---------------------------------------------------------------------------
