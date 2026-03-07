@@ -120,7 +120,8 @@ class StrategyEngine:
             "rsi_healthy":        35 <= float(r["rsi"]) <= 65,
             "price_above_vwap":   float(r["close"]) > float(r["vwap"]),
             "ema_aligned":        float(r["ema_9"]) > float(r["ema_21"]),
-            "volume_breakout":    bool(r["vol_breakout"]),
+           '''  "volume_breakout":    bool(r["vol_breakout"]), '''
+	    "volume_breakout":     True,
         }
 
         # ---- SELL conditions ------------------------------------------
@@ -143,7 +144,7 @@ class StrategyEngine:
         sl_pct  = rcfg.default_sl_pct
         tgt_pct = rcfg.default_target_pct
 
-        if buy_score >= 0.70:   # at least 3.5 / 5 conditions
+        if buy_score >= 0.10:   # at least 3.5 / 5 conditions
             sl  = round(entry_price * (1 - sl_pct), 2)
             tgt = round(entry_price * (1 + tgt_pct), 2)
             reasons = [k for k, v in buy_conditions.items() if v]
@@ -154,7 +155,7 @@ class StrategyEngine:
                 reason=", ".join(reasons), indicators=ind,
             )
 
-        if sell_score >= 0.60:
+        if sell_score >= 0.20:
             sl  = round(entry_price * (1 + sl_pct), 2)
             tgt = round(entry_price * (1 - tgt_pct), 2)
             reasons = [k for k, v in sell_conditions.items() if v]

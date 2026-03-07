@@ -1,19 +1,22 @@
 """
 data_fetcher.py — Historical and live market data with disk caching.
 
-In paper trading mode the module can also generate synthetic intraday data
-so the system runs without a valid Kite token (useful for dry-runs / CI).
+Data sources:
+  - Yahoo Finance (config.data_provider == "yahoo"): used for paper mode.
+    No Zerodha credentials required. Works 24/7 with real historical candles.
+  - Zerodha KiteConnect (config.data_provider == "zerodha"): used for sim/live.
+    Requires valid Kite access token.
+
+No synthetic data is generated anywhere in this module.
 """
 
 from __future__ import annotations
 
 import os
 import pickle
-import random
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
 
-import numpy as np
 import pandas as pd
 import pytz
 
@@ -25,6 +28,34 @@ log = get_logger("DataFetcher")
 
 IST = pytz.timezone("Asia/Kolkata")
 CACHE_EXT = ".pkl"
+
+# Maximum lookback Yahoo Finance supports per interval
+_YAHOO_MAX_DAYS: Dict[str, int] = {
+    "1m":  6,
+    "2m":  59,
+    "5m":  59,
+    "15m": 59,
+    "30m": 59,
+    "90m": 59,
+    "60m": 729,
+    "1h":  729,
+    "1d":  9999,
+    "5d":  9999,
+    "1wk": 9999,
+    "1mo": 9999,
+}
+
+# Kite interval → Yahoo interval
+_YAHOO_INTERVAL_MAP: Dict[str, str] = {
+    "minute":   "1m",
+    "3minute":  "5m",    # 3m not available in Yahoo; use 5m
+    "5minute":  "5m",
+    "10minute": "15m",   # 10m not available; use 15m
+    "15minute": "15m",
+    "30minute": "30m",
+    "60minute": "60m",
+    "day":      "1d",
+}
 
 
 class DataFetcher:
@@ -41,10 +72,12 @@ class DataFetcher:
         self,
         symbol: str,
         interval: str,
-        days: int = 60,
+        days: int = None,
         use_cache: bool = True,
     ) -> pd.DataFrame:
         """Return a clean OHLCV DataFrame for *symbol* over the past *days*."""
+        if days is None:
+            days = config.history_days
         end_dt   = datetime.now(tz=IST)
         start_dt = end_dt - timedelta(days=days)
         return self._fetch(symbol, interval, start_dt, end_dt, use_cache)
@@ -54,31 +87,43 @@ class DataFetcher:
         symbol: str,
         interval: str = "5minute",
     ) -> pd.DataFrame:
-        """Today's intraday candles (no cache — always fresh)."""
+        """
+        Today's intraday candles (no cache — always fresh).
+        In Yahoo mode returns last 5 days of intraday candles so the bot
+        has data even when the market is currently closed.
+        """
+        if config.data_provider == "yahoo":
+            return self._yahoo_intraday(symbol, interval)
+
+        # Zerodha: today's session only
         now      = datetime.now(tz=IST)
         start_dt = now.replace(hour=9, minute=15, second=0, microsecond=0)
         return self._fetch(symbol, interval, start_dt, now, use_cache=False)
 
     def get_quote(self, symbol: str) -> float:
         """Return current last-traded price."""
-        if config.trading.paper_trading:
-            return self._mock_ltp(symbol)
+        if config.data_provider == "yahoo":
+            return self._yahoo_last_price(symbol)
+
+        # Zerodha (sim or live)
         try:
             quote = kite_client.get_quote(symbol)
             return float(quote.get("last_price", 0.0))
         except Exception as e:
-            log.error("get_quote(%s) failed: %s", symbol, e)
-            return 0.0
+            log.error("get_quote(%s) via Kite failed: %s — falling back to Yahoo", symbol, e)
+            return self._yahoo_last_price(symbol)
 
     def get_batch_quotes(self, symbols: List[str]) -> Dict[str, float]:
         """LTP for multiple symbols at once."""
-        if config.trading.paper_trading:
-            return {s: self._mock_ltp(s) for s in symbols}
+        if config.data_provider == "yahoo":
+            return {s: self._yahoo_last_price(s) for s in symbols}
+
+        # Zerodha
         try:
             return kite_client.get_ltp(symbols)
         except Exception as e:
-            log.error("get_batch_quotes failed: %s", e)
-            return {}
+            log.error("get_batch_quotes via Kite failed: %s — falling back to Yahoo", e)
+            return {s: self._yahoo_last_price(s) for s in symbols}
 
     def get_swing_data(
         self, symbol: str, days: int = 365
@@ -87,7 +132,7 @@ class DataFetcher:
         return self.get_historical(symbol, "day", days=days, use_cache=True)
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal routing
     # ------------------------------------------------------------------
 
     def _fetch(
@@ -106,8 +151,8 @@ class DataFetcher:
                 log.debug("Cache hit: %s", cache_key)
                 return cached
 
-        if config.trading.paper_trading:
-            df = self._fetch_live_or_mock(symbol, interval, start_dt, end_dt)
+        if config.data_provider == "yahoo":
+            df = self._fetch_from_yahoo(symbol, interval, start_dt, end_dt)
         else:
             df = self._fetch_from_kite(symbol, interval, start_dt, end_dt)
 
@@ -115,6 +160,147 @@ class DataFetcher:
             if use_cache:
                 self._save_cache(cache_key, df)
         return df if df is not None else pd.DataFrame()
+
+    # ------------------------------------------------------------------
+    # Yahoo Finance fetcher
+    # ------------------------------------------------------------------
+
+    def _fetch_from_yahoo(
+        self,
+        symbol: str,
+        interval: str,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> pd.DataFrame:
+        try:
+            import yfinance as yf
+        except ImportError:
+            log.critical("yfinance not installed. Run: pip install yfinance")
+            return pd.DataFrame()
+
+        yf_interval = _YAHOO_INTERVAL_MAP.get(interval, "5m")
+        max_days    = _YAHOO_MAX_DAYS.get(yf_interval, 59)
+
+        # Cap start date to Yahoo's limit for this interval
+        earliest_start = datetime.now(tz=IST) - timedelta(days=max_days)
+        if start_dt < earliest_start:
+            log.debug(
+                "Yahoo: capping %s [%s] start from %s to %s (provider limit %d days)",
+                symbol, yf_interval,
+                start_dt.date(), earliest_start.date(), max_days,
+            )
+            start_dt = earliest_start
+
+        ticker_sym = f"{symbol}.NS"
+        # Yahoo end is exclusive — add 1 day to include end_dt
+        end_date = end_dt.date() + timedelta(days=1)
+
+        try:
+            ticker = yf.Ticker(ticker_sym)
+            df = ticker.history(
+                start=start_dt.date(),
+                end=end_date,
+                interval=yf_interval,
+                auto_adjust=True,
+                prepost=False,
+            )
+        except Exception as e:
+            log.error("Yahoo fetch failed for %s [%s]: %s", symbol, interval, e)
+            return pd.DataFrame()
+
+        if df is None or df.empty:
+            log.warning("Yahoo returned no data for %s [%s]", symbol, interval)
+            return pd.DataFrame()
+
+        # Normalize columns
+        df.columns = [c.lower() for c in df.columns]
+
+        # Keep only OHLCV
+        required = {"open", "high", "low", "close", "volume"}
+        missing  = required - set(df.columns)
+        if missing:
+            log.error("Yahoo response missing columns %s for %s", missing, symbol)
+            return pd.DataFrame()
+
+        df = df[["open", "high", "low", "close", "volume"]].copy()
+
+        # Ensure tz-aware IST index
+        if df.index.tzinfo is None:
+            df.index = df.index.tz_localize("UTC").tz_convert(IST)
+        else:
+            df.index = df.index.tz_convert(IST)
+
+        df.index.name = "datetime"
+        df.sort_index(inplace=True)
+        df.dropna(subset=["open", "high", "low", "close"], inplace=True)
+
+        log.debug("Yahoo returned %d candles for %s [%s]", len(df), symbol, interval)
+        return df
+
+    def _yahoo_intraday(self, symbol: str, interval: str) -> pd.DataFrame:
+        """Last 5 days of intraday candles from Yahoo (works even when market closed)."""
+        try:
+            import yfinance as yf
+        except ImportError:
+            log.critical("yfinance not installed. Run: pip install yfinance")
+            return pd.DataFrame()
+
+        yf_interval = _YAHOO_INTERVAL_MAP.get(interval, "5m")
+        ticker_sym  = f"{symbol}.NS"
+
+        try:
+            ticker = yf.Ticker(ticker_sym)
+            df = ticker.history(period="5d", interval=yf_interval,
+                                auto_adjust=True, prepost=False)
+        except Exception as e:
+            log.error("Yahoo intraday fetch failed for %s: %s", symbol, e)
+            return pd.DataFrame()
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df.columns = [c.lower() for c in df.columns]
+        required = {"open", "high", "low", "close", "volume"}
+        if not required.issubset(df.columns):
+            return pd.DataFrame()
+
+        df = df[["open", "high", "low", "close", "volume"]].copy()
+
+        if df.index.tzinfo is None:
+            df.index = df.index.tz_localize("UTC").tz_convert(IST)
+        else:
+            df.index = df.index.tz_convert(IST)
+
+        df.index.name = "datetime"
+        df.sort_index(inplace=True)
+        df.dropna(subset=["open", "high", "low", "close"], inplace=True)
+        return df
+
+    def _yahoo_last_price(self, symbol: str) -> float:
+        """Return the most recent available price from Yahoo Finance."""
+        try:
+            import yfinance as yf
+            ticker = yf.Ticker(f"{symbol}.NS")
+            # fast_info.last_price is quickest and works outside market hours
+            price = ticker.fast_info.last_price
+            if price and price > 0:
+                return float(price)
+        except Exception:
+            pass
+
+        # Fallback: last close from recent history
+        try:
+            import yfinance as yf
+            hist = yf.Ticker(f"{symbol}.NS").history(period="5d", interval="1d")
+            if not hist.empty:
+                return float(hist["Close"].iloc[-1])
+        except Exception as e:
+            log.error("Yahoo last price fallback failed for %s: %s", symbol, e)
+        return 0.0
+
+    # ------------------------------------------------------------------
+    # Zerodha / Kite fetcher
+    # ------------------------------------------------------------------
 
     def _fetch_from_kite(
         self,
@@ -138,77 +324,6 @@ class DataFetcher:
         except Exception as e:
             log.error("Kite historical fetch failed for %s: %s", symbol, e)
             return pd.DataFrame()
-
-    def _fetch_live_or_mock(
-        self,
-        symbol: str,
-        interval: str,
-        start_dt: datetime,
-        end_dt: datetime,
-    ) -> pd.DataFrame:
-        """Try real Kite call; fall back to synthetic data in paper mode."""
-        try:
-            if kite_client._kite is not None:
-                return self._fetch_from_kite(symbol, interval, start_dt, end_dt)
-        except Exception:
-            pass
-        log.info("Generating synthetic data for %s [%s] (paper mode)", symbol, interval)
-        return self._generate_synthetic(symbol, interval, start_dt, end_dt)
-
-    # ------------------------------------------------------------------
-    # Synthetic data generator (paper trading / testing)
-    # ------------------------------------------------------------------
-
-    _BASE_PRICES: Dict[str, float] = {
-        "RELIANCE": 2950.0, "TCS": 3800.0, "INFY": 1780.0,
-        "HDFCBANK": 1670.0, "ICICIBANK": 1120.0, "SBIN": 830.0,
-        "WIPRO": 560.0,  "HCLTECH": 1680.0, "AXISBANK": 1200.0,
-        "KOTAKBANK": 1870.0,
-    }
-
-    def _generate_synthetic(
-        self,
-        symbol: str,
-        interval: str,
-        start_dt: datetime,
-        end_dt: datetime,
-    ) -> pd.DataFrame:
-        freq_map = {
-            "minute":  "1min", "3minute":  "3min",  "5minute": "5min",
-            "10minute":"10min", "15minute":"15min", "30minute":"30min",
-            "60minute":"60min", "day": "1D",
-        }
-        freq   = freq_map.get(interval, "5min")
-        times  = pd.date_range(start=start_dt, end=end_dt, freq=freq, tz=IST)
-
-        # Filter to market hours for intraday
-        if "D" not in freq:
-            times = times[
-                ((times.hour > 9) | ((times.hour == 9) & (times.minute >= 15))) &
-                ((times.hour < 15) | ((times.hour == 15) & (times.minute <= 30)))
-            ]
-
-        base = self._BASE_PRICES.get(symbol, 1000.0)
-        n = len(times)
-        if n == 0:
-            return pd.DataFrame()
-
-        rng   = np.random.default_rng(hash(symbol) % (2**31))
-        pct   = rng.normal(0.0001, 0.003, n)
-        close = base * np.exp(np.cumsum(pct))
-
-        high   = close * (1 + rng.uniform(0.001, 0.008, n))
-        low    = close * (1 - rng.uniform(0.001, 0.008, n))
-        open_  = low + rng.uniform(0, 1, n) * (high - low)
-        volume = rng.integers(50_000, 500_000, n).astype(float)
-
-        df = pd.DataFrame(
-            {"open": open_, "high": high, "low": low,
-             "close": close, "volume": volume},
-            index=times,
-        )
-        df.index.name = "datetime"
-        return df
 
     # ------------------------------------------------------------------
     # Cache helpers
@@ -238,13 +353,6 @@ class DataFetcher:
                 pickle.dump(df, f)
         except Exception as e:
             log.warning("Cache write failed (%s): %s", key, e)
-
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _mock_ltp(symbol: str) -> float:
-        base = DataFetcher._BASE_PRICES.get(symbol, 1000.0)
-        return round(base * random.uniform(0.98, 1.02), 2)
 
 
 # Singleton

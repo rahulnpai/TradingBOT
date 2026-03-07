@@ -7,12 +7,16 @@ Rules enforced:
   3. Daily loss limit: if realised P&L < -3 % of capital, halt trading.
   4. No duplicate positions in the same symbol.
   5. Computed quantity is always at least 1 share.
+  6. Trade cooldown: 15 min no-trade window after a stop-loss exit.
+  7. Max trades per symbol: default 3 entries per symbol per day.
 """
 
 from __future__ import annotations
 
+import csv
+import os
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Dict, List, Optional
 
 from config import config
@@ -114,13 +118,24 @@ class OpenPosition:
 class RiskManager:
 
     def __init__(self) -> None:
-        self._rcfg        = config.risk
-        self._capital     = self._rcfg.capital
-        self._daily_pnl   = 0.0
+        self._rcfg         = config.risk
+        self._capital      = self._rcfg.capital
+        self._daily_pnl    = 0.0
         self._realised_pnl = 0.0
+        self._total_pnl    = 0.0
+        self._total_trades = 0
+        self._total_wins   = 0
         self._today        = date.today()
         self._positions: Dict[str, OpenPosition] = {}
         self._halted       = False
+
+        # ---- professional risk controls ----------------------------------
+        # Cooldown: symbol → datetime of last SL exit
+        self._last_exit_time: Dict[str, datetime] = {}
+        # Max trades per symbol per day
+        self._trade_count_today: Dict[str, int] = {}
+
+        os.makedirs(config.data_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Public API
@@ -130,17 +145,16 @@ class RiskManager:
         """Convert a Signal into a validated TradeOrder (or a rejected one)."""
         self._reset_if_new_day()
 
-        reject = self._check_halt(signal)
-        if reject:
-            return reject
-
-        reject = self._check_duplicate(signal)
-        if reject:
-            return reject
-
-        reject = self._check_max_positions(signal)
-        if reject:
-            return reject
+        for check in (
+            self._check_halt,
+            self._check_cooldown,
+            self._check_duplicate,
+            self._check_max_positions,
+            self._check_max_trades_symbol,
+        ):
+            reject = check(signal)
+            if reject:
+                return reject
 
         quantity = self._compute_quantity(signal)
         if quantity < 1:
@@ -180,26 +194,61 @@ class RiskManager:
             strategy_type=order.strategy_type,
         )
         self._positions[order.symbol] = pos
-        log.info("Position opened: %s %s x%d", order.action, order.symbol, order.quantity)
+
+        # Track trade count per symbol
+        self._trade_count_today[order.symbol] = (
+            self._trade_count_today.get(order.symbol, 0) + 1
+        )
+        log.info(
+            "Position opened: %s %s x%d  (trades today in %s: %d)",
+            order.action, order.symbol, order.quantity,
+            order.symbol, self._trade_count_today[order.symbol],
+        )
 
     def close_position(self, symbol: str, exit_price: float) -> float:
         """Close position, update P&L, return realised P&L."""
-        pos = self._positions.pop(symbol, None)
+        # Inspect position BEFORE removing — needed for SL cooldown detection
+        pos = self._positions.get(symbol)
         if pos is None:
             return 0.0
+
+        sl_hit = pos.is_stoploss_hit(exit_price)
+
+        self._positions.pop(symbol)
         pnl = pos.unrealised_pnl(exit_price)
         self._daily_pnl    += pnl
         self._realised_pnl += pnl
+        self._total_pnl    += pnl
+        self._total_trades += 1
+        if pnl > 0:
+            self._total_wins += 1
+
         log.info(
             "Position closed: %s %s  pnl=₹%.2f  daily_pnl=₹%.2f",
             pos.action, symbol, pnl, self._daily_pnl,
         )
-        if self._daily_pnl < -(self._capital * self._rcfg.daily_loss_limit_pct):
+
+        # ---- Cooldown: record exit time on SL hit ----------------------
+        if sl_hit:
+            self._last_exit_time[symbol] = datetime.now()
+            log.info(
+                "COOLDOWN SET: %s — no new trades for %d min",
+                symbol, self._rcfg.cooldown_minutes,
+            )
+
+        # ---- Daily loss kill switch ------------------------------------
+        limit = -(self._capital * self._rcfg.daily_loss_limit_pct)
+        if self._daily_pnl < limit:
             self._halted = True
             log.critical(
-                "DAILY LOSS LIMIT HIT: daily_pnl=₹%.2f  halt=True",
-                self._daily_pnl,
+                "DAILY LOSS LIMIT REACHED — TRADING HALTED. "
+                "daily_pnl=₹%.2f  limit=₹%.2f",
+                self._daily_pnl, limit,
             )
+
+        # ---- Equity snapshot to CSV ------------------------------------
+        self._write_equity_snapshot()
+
         return pnl
 
     def update_trailing_stops(self, prices: Dict[str, float]) -> None:
@@ -254,11 +303,16 @@ class RiskManager:
         return max(0.0, self._capital - committed)
 
     def summary(self) -> dict:
+        win_rate = (self._total_wins / self._total_trades * 100
+                    if self._total_trades > 0 else 0.0)
         return {
             "capital": self._capital,
             "available_capital": round(self.available_capital, 2),
             "daily_pnl": round(self._daily_pnl, 2),
             "realised_pnl": round(self._realised_pnl, 2),
+            "total_pnl": round(self._total_pnl, 2),
+            "total_trades": self._total_trades,
+            "win_rate_pct": round(win_rate, 2),
             "open_positions": len(self._positions),
             "halted": self._halted,
         }
@@ -268,15 +322,63 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def _compute_quantity(self, signal: Signal) -> int:
-        max_capital = self._capital * self._rcfg.max_capital_per_trade_pct
+        """
+        Smart capital allocation based on signal confidence.
+
+        Confidence tiers (risk as % of total capital):
+          < 0.30  → 0.5%
+          0.30–0.60 → 1.0%
+          > 0.60  → 2.0%
+
+        Position size = risk_amount / SL_distance.
+        Capped to available_capital / entry_price.
+        """
         if signal.entry_price <= 0:
             return 0
-        qty = int(max_capital // signal.entry_price)
+
+        conf = signal.confidence
+        if conf < 0.30:
+            risk_pct = 0.005
+        elif conf < 0.60:
+            risk_pct = 0.010
+        else:
+            risk_pct = 0.020
+
+        risk_amount  = self._capital * risk_pct
+        sl_distance  = abs(signal.entry_price - signal.suggested_sl)
+
+        if sl_distance > 0:
+            qty = int(risk_amount / sl_distance)
+        else:
+            # Fallback: percentage of capital when no valid SL distance
+            qty = int((self._capital * self._rcfg.max_capital_per_trade_pct)
+                      // signal.entry_price)
+
+        # Never exceed available capital
+        avail = self.available_capital
+        if avail > 0:
+            max_by_capital = int(avail // signal.entry_price)
+            qty = min(qty, max_by_capital)
+
         return max(0, qty)
 
     def _check_halt(self, signal: Signal) -> Optional[TradeOrder]:
         if self._halted:
             return self._reject(signal, "Trading halted — daily loss limit breached")
+        return None
+
+    def _check_cooldown(self, signal: Signal) -> Optional[TradeOrder]:
+        """Block new trades in a symbol for cooldown_minutes after a SL exit."""
+        last_exit = self._last_exit_time.get(signal.symbol)
+        if last_exit is None:
+            return None
+        elapsed_min = (datetime.now() - last_exit).total_seconds() / 60.0
+        remaining   = self._rcfg.cooldown_minutes - elapsed_min
+        if remaining > 0:
+            return self._reject(
+                signal,
+                f"Cooldown active: {signal.symbol} — {remaining:.0f} min remaining after SL exit",
+            )
         return None
 
     def _check_duplicate(self, signal: Signal) -> Optional[TradeOrder]:
@@ -288,6 +390,16 @@ class RiskManager:
         if len(self._positions) >= self._rcfg.max_open_positions:
             return self._reject(
                 signal, f"Max open positions ({self._rcfg.max_open_positions}) reached"
+            )
+        return None
+
+    def _check_max_trades_symbol(self, signal: Signal) -> Optional[TradeOrder]:
+        """Enforce max trades per symbol per day."""
+        count = self._trade_count_today.get(signal.symbol, 0)
+        if count >= self._rcfg.max_trades_per_symbol:
+            return self._reject(
+                signal,
+                f"Max trades per symbol ({self._rcfg.max_trades_per_symbol}) reached for {signal.symbol} today",
             )
         return None
 
@@ -312,10 +424,35 @@ class RiskManager:
     def _reset_if_new_day(self) -> None:
         today = date.today()
         if today != self._today:
-            log.info("New trading day — resetting daily P&L and halt flag.")
-            self._daily_pnl = 0.0
-            self._halted    = False
-            self._today     = today
+            log.info("New trading day — resetting daily counters.")
+            self._daily_pnl         = 0.0
+            self._halted            = False
+            self._today             = today
+            self._trade_count_today = {}
+            self._last_exit_time    = {}
+
+    def _write_equity_snapshot(self) -> None:
+        """Append an equity summary row to data/trade_log.csv after each close."""
+        win_rate = (self._total_wins / self._total_trades * 100
+                    if self._total_trades > 0 else 0.0)
+        row = {
+            "timestamp":     datetime.now().isoformat(),
+            "daily_pnl":     round(self._daily_pnl, 2),
+            "total_pnl":     round(self._total_pnl, 2),
+            "trade_count":   self._total_trades,
+            "win_rate_pct":  round(win_rate, 2),
+            "capital":       round(self._capital, 2),
+        }
+        path         = os.path.join(config.data_dir, "trade_log.csv")
+        write_header = not os.path.exists(path)
+        try:
+            with open(path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=row.keys())
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
+        except Exception as e:
+            log.warning("Failed to write equity snapshot: %s", e)
 
 
 # Singleton
