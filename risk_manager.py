@@ -322,10 +322,44 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def _compute_quantity(self, signal: Signal) -> int:
-        max_capital = self._capital * self._rcfg.max_capital_per_trade_pct
+        """
+        Smart capital allocation based on signal confidence.
+
+        Confidence tiers (risk as % of total capital):
+          < 0.30  → 0.5%
+          0.30–0.60 → 1.0%
+          > 0.60  → 2.0%
+
+        Position size = risk_amount / SL_distance.
+        Capped to available_capital / entry_price.
+        """
         if signal.entry_price <= 0:
             return 0
-        qty = int(max_capital // signal.entry_price)
+
+        conf = signal.confidence
+        if conf < 0.30:
+            risk_pct = 0.005
+        elif conf < 0.60:
+            risk_pct = 0.010
+        else:
+            risk_pct = 0.020
+
+        risk_amount  = self._capital * risk_pct
+        sl_distance  = abs(signal.entry_price - signal.suggested_sl)
+
+        if sl_distance > 0:
+            qty = int(risk_amount / sl_distance)
+        else:
+            # Fallback: percentage of capital when no valid SL distance
+            qty = int((self._capital * self._rcfg.max_capital_per_trade_pct)
+                      // signal.entry_price)
+
+        # Never exceed available capital
+        avail = self.available_capital
+        if avail > 0:
+            max_by_capital = int(avail // signal.entry_price)
+            qty = min(qty, max_by_capital)
+
         return max(0, qty)
 
     def _check_halt(self, signal: Signal) -> Optional[TradeOrder]:
